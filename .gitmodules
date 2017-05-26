@@ -1,0 +1,3 @@
+[submodule "threading"]
+	path = threading
+	url = https://github.com/LabDin/Simple-Multithreading
