@@ -31,6 +31,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 
   
 #define IP_MAX_MESSAGE_LENGTH 512       ///< Maximum allowed length of messages transmitted through an IP connection
