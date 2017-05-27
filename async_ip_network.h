@@ -38,7 +38,7 @@
 /// @param[in] connectionType flag defining connection as client or server, TCP or UDP (see ip_connection.h)                                   
 /// @param[in] host IPv4 or IPv6 host string (NULL for server listening on any local address)                                         
 /// @param[in] port IP port number (local for server, remote for client)       
-/// @return unique generic identifier to newly created connection (IP_CONNECTION_INVALID_ID on error) 
+/// @return unique generic identifier for newly created connection (IP_CONNECTION_INVALID_ID on error) 
 unsigned long AsyncIP_OpenConnection( uint8_t connectionType, const char* host, uint16_t port );
 
 /// @brief Handle termination of connection corresponding to given identifier                             
