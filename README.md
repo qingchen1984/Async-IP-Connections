@@ -18,7 +18,7 @@ For detecting socket input more efficiently, this library uses [poll](http://man
 
 >$ gcc async_ip_network.c ip_network.c threading/threads.c threading/thread_safe_maps.c threading/thread_safe_queues.c -DIP_NETWORK_LEGACY -Ithreading -shared -fPIC -o ip.so
 
-Which will use [select](http://man7.org/linux/man-pages/man2/select.2.html), slower but more supported.
+Which will use [select](http://man7.org/linux/man-pages/man2/select.2.html), slower but more widely supported.
 
 ### Documentation
 
