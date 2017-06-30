@@ -30,7 +30,7 @@
 #define IPC_H
 
 
-#include "ipc_definitions"
+#include "ipc_definitions.h"
 
 /// @brief Creates a new IP connection structure (with defined properties) and add it to the asynchronous connections list                              
 /// @param[in] flags configuration variable defining connection as client or server, TCP or UDP                                   

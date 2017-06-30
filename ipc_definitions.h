@@ -41,6 +41,13 @@ typedef uint8_t Byte;
 
 typedef Byte RemoteID[ IPC_MAX_ID_LENGTH ];
 
+typedef struct _Message
+{
+  Byte data[ IPC_MAX_MESSAGE_LENGTH ];
+  RemoteID address;
+}
+Message;
+
 /// Structure that stores data of a single IP connection
 //typedef struct _IPCConnectionData IPCConnectionData;
 /// Opaque type to reference encapsulated IP connection structure

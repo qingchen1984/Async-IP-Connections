@@ -30,7 +30,7 @@
 #define IP_NETWORK_H
 
 
-#include "ipc_definitions" 
+#include "ipc_definitions.h" 
 
 
 /// Structure that stores data of a single IP connection
@@ -44,58 +44,22 @@ typedef IPConnectionData* IPConnection;
 /// @param[in] host IPv4 or IPv6 host string (NULL for server listening on any local address)                                         
 /// @param[in] port IP port number (local for server, remote for client)       
 /// @return unique generic identifier to newly created connection (NULL on error) 
-IPConnection IP_OpenConnection( uint8_t connectionType, const char* host, uint16_t port );
+IPConnection IP_OpenConnection( Byte connectionType, const char* host, uint16_t port );
 
 /// @brief Handle termination of given connection                                   
 /// @param[in] connection connection reference
 void IP_CloseConnection( IPConnection connection );
-                                                                             
-/// @brief Returns address string (host and port) for the given connection                                                
-/// @param[in] connection connection reference                                         
-/// @return address string ("<host>/<port>")
-char* IP_GetAddress( IPConnection connection );
-                                                                          
-/// @brief Returns number of clients for the given server connection                                               
-/// @param[in] connection server connection reference                                         
-/// @return number of clients (1 for client connection and 0 on error)  
-size_t IP_GetClientsNumber( IPConnection connection );
-
-/// @brief Verifies if given connection is of server type/role
-/// @param[in] connection connection reference 
-/// @return true for server connection, false for client or on error
-bool IP_IsServer( IPConnection connection );
-                                                                      
-/// @brief Defines fixed message length for the given connection                                                
-/// @param[in] connection connection reference                                 
-/// @param[in] messageLength desired length (in bytes, limited by IP_MAX_MESSAGE_LENGTH) of the connection messages                                               
-/// @return actual new length of connection messages 
-size_t IP_SetMessageLength( IPConnection connection, size_t messageLength );
  
 /// @brief Calls type specific client method for receiving network messages                      
 /// @param[in] connection client connection reference  
 /// @return pointer to message string, overwritten on next call to ReceiveMessage() (NULL on error)  
-char* IP_ReceiveMessage( IPConnection connection );
+bool IP_ReceiveMessage( IPConnection connection, Message* message );
                                                                              
 /// @brief Calls type specific connection method for sending network messages                                                
 /// @param[in] connection connection reference   
 /// @param[in] message message string pointer  
-/// @return 0 on success, -1 on error  
-int IP_SendMessage( IPConnection connection, const char* message );
-                                                                            
-/// @brief Calls type specific server method for accepting new network clients                                                
-/// @param[in] connection server connection reference        
-/// @return reference to already filled newly accepted client (NULL on error)  
-IPConnection IP_AcceptClient( IPConnection connection );
-                                                                             
-/// @brief Blocks execution on calling thread for given time or until a network event (read/accept) is available                                                
-/// @param[in] milliseconds timeout for network events waiting (in milliseconds)    
-/// @return number of events detected (0 on timeout or error)  
-int IP_WaitEvent( unsigned int milliseconds );
-                                                                             
-/// @brief Verifies if given connection has data (messages for clients, clients for server) to be read                                                
-/// @param[in] connection connection reference        
-/// @return true if data is available, false otherwise 
-bool IP_IsDataAvailable( IPConnection connection );
+/// @return true on success, false on error  
+bool IP_SendMessage( IPConnection connection, const Message* message );
 
 
 #endif // IP_NETWORK_H

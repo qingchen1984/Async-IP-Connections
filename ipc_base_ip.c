@@ -25,6 +25,11 @@
 ///// as server or client, using TCP or UDP protocols                           /////
 /////////////////////////////////////////////////////////////////////////////////////
 
+#include "ipc_base_ip.h"
+
+#include "threads/threads.h"
+#include "threads/thread_safe_queues.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -87,32 +92,39 @@ typedef struct sockaddr* IPAddress;                             // Opaque IP add
 #define IS_IP_MULTICAST_ADDRESS( address ) ( IS_IPV4_MULTICAST_ADDRESS( address ) || IS_IPV6_MULTICAST_ADDRESS( address ) )
 #define ARE_EQUAL_IP_ADDRESSES( address_1, address_2 ) ( ARE_EQUAL_IPV4_ADDRESSES( address_1, address_2 ) || ARE_EQUAL_IPV6_ADDRESSES( address_1, address_2 ) )
 
-#include "ip_network.h"
-
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////                                      INTERFACE DEFINITION                                       /////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+const size_t QUEUE_MAX_ITEMS = 10;
+const unsigned long EVENT_WAIT_TIME_MS = 5000;
+
 // Generic structure to store methods and data of any connection type handled by the library
 struct _IPConnectionData
 {
   SocketPoller* socket;
-  union {
-    char* (*ref_ReceiveMessage)( IPConnection );
-    IPConnection (*ref_AcceptClient)( IPConnection );
-  };
-  int (*ref_SendMessage)( IPConnection, const char* );
+  void (*ref_ReceiveMessage)( IPConnection );
+  void (*ref_SendMessage)( IPConnection, const Byte*, const RemoteID* );
   void (*ref_Close)( IPConnection );
   IPAddressData addressData;
-  IPConnection* remotesList;
-  size_t remotesCount;
+  RemoteID* clientsList;
+  size_t clientsCount;
+  TSQueue readQueue;
+  TSQueue writeQueue;
 };
-
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
 /////                                        GLOBAL VARIABLES                                         /////
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Thread for asyncronous connections update
+static Thread globalReadThread = THREAD_INVALID_HANDLE;
+static Thread globalWriteThread = THREAD_INVALID_HANDLE;
+static volatile bool isNetworkRunning = false;
+
+static IPConnection* globalConnectionsList = NULL;
+static size_t activeConnectionsCount = 0;
 
 #ifdef IP_NETWORK_LEGACY
 static fd_set polledSocketsSet = { 0 };
@@ -127,71 +139,20 @@ static size_t polledSocketsNumber = 0;
 /////////////////////////////////////////////////////////////////////////////
 
 
-static char* ReceiveTCPMessage( IPConnection );
-static char* ReceiveUDPMessage( IPConnection );
-static int SendTCPMessage( IPConnection, const char* );
-static int SendUDPMessage( IPConnection, const char* );
-static int SendMessageAll( IPConnection, const char* );
-static IPConnection AcceptTCPClient( IPConnection );
-static IPConnection AcceptUDPClient( IPConnection );
+static void ReceiveTCPClientMessage( IPConnection );
+static void ReceiveUDPClientMessage( IPConnection );
+static void ReceiveTCPServerMessages( IPConnection );
+static void ReceiveUDPServerMessages( IPConnection );
+static void SendTCPClientMessage( IPConnection, const Byte*, const RemoteID* );
+static void SendUDPClientMessage( IPConnection, const Byte*, const RemoteID* );
+static void SendServerMessages( IPConnection, const Byte*, const RemoteID* );
 static void CloseTCPServer( IPConnection );
 static void CloseUDPServer( IPConnection );
 static void CloseTCPClient( IPConnection );
 static void CloseUDPClient( IPConnection );
 
-/////////////////////////////////////////////////////////////////////////////
-/////                         NETWORK UTILITIES                         /////
-/////////////////////////////////////////////////////////////////////////////
-
-// System calls for getting IP address strings
-char* GetAddressString( IPAddress address )
-{                                           
-  static char addressString[ ADDRESS_LENGTH ];
-  
-  #ifndef IP_NETWORK_LEGACY
-  int error = getnameinfo( address, sizeof(IPAddressData), addressString, ADDRESS_LENGTH - PORT_LENGTH, NULL, 0, NI_NUMERICHOST );
-  error = getnameinfo( address, sizeof(IPAddressData), NULL, 0, addressString + strlen( addressString ) + 1, PORT_LENGTH, NI_NUMERICSERV );
-  if( error != 0 )
-  {
-    fprintf( stderr, "getnameinfo: failed getting address string: %s", gai_strerror( error ) );
-    return NULL;
-  }
-  #else
-  sprintf( addressString, "%s", inet_ntoa( ((IPAddressData*) address)->sin_addr ) );
-  sprintf( addressString + strlen( addressString ) + 1, "%u", ((IPAddressData*) address)->sin_port );
-  #endif
-  addressString[ strlen( addressString ) ] = '/';
-  
-  return addressString;
-}
-
-// Utility method to request an address (host and port) string for client connections (returns default values for server connections)
-char* IP_GetAddress( IPConnection connection )
-{
-  if( connection == NULL ) return NULL;
-  
-  return GetAddressString( (IPAddress) &(connection->addressData) );
-}
-
-// Returns number of active clients for a connection 
-size_t IP_GetClientsNumber( IPConnection connection )
-{
-  if( connection == NULL ) return 0;
-  
-  if( IP_IsServer( connection ) )
-    return *(connection->ref_clientsCount);
-  
-  return 1;
-}
-
-bool IP_IsServer( IPConnection connection )
-{
-  if( connection == NULL ) return false;
-  
-  if( connection->ref_Close == CloseTCPServer || connection->ref_Close == CloseUDPServer ) return true;
-  
-  return false;
-}
+static void* AsyncReadQueues( void* );
+static void* AsyncWriteQueues( void* );
 
 
 //////////////////////////////////////////////////////////////////////////////////
@@ -205,77 +166,76 @@ static int CompareSockets( const void* ref_socket_1, const void* ref_socket_2 )
 }
 #endif
 
+static SocketPoller* AddSocketPoller( Socket socketFD )
+{
+  #ifndef IP_NETWORK_LEGACY
+  SocketPoller cmpPoller = { .fd = socketFD };
+  SocketPoller* socketPoller = (SocketPoller*) bsearch( &cmpPoller, polledSocketsList, polledSocketsNumber, sizeof(SocketPoller), CompareSockets );
+  if( csocketPoller == NULL )
+  {
+    socketPoller = &(polledSocketsList[ polledSocketsNumber ]);
+    socketPoller->fd = socketFD;
+    socketPoller->events = POLLRDNORM | POLLRDBAND;
+    polledSocketsNumber++;
+    qsort( polledSocketsList, polledSocketsNumber, sizeof(SocketPoller), CompareSockets );
+  }
+  #else
+  SocketPoller* socketPoller = (SocketPoller*) malloc( sizeof(SocketPoller) );
+  FD_SET( socketFD, &polledSocketsSet );
+  if( socketFD >= polledSocketsNumber ) polledSocketsNumber = socketFD + 1;
+  socketPoller->fd = socketFD;
+  #endif
+  return socketPoller;
+}
+
 // Handle construction of a IPConnection structure with the defined properties
 static IPConnection AddConnection( Socket socketFD, IPAddress address, uint8_t transportProtocol, uint8_t networkRole )
 {
   IPConnection connection = (IPConnection) malloc( sizeof(IPConnectionData) );
   memset( connection, 0, sizeof(IPConnectionData) );
   
-  #ifndef IP_NETWORK_LEGACY
-  SocketPoller cmpPoller = { .fd = socketFD };
-  connection->socket = (SocketPoller*) bsearch( &cmpPoller, polledSocketsList, polledSocketsNumber, sizeof(SocketPoller), CompareSockets );
-  if( connection->socket == NULL )
-  {
-    connection->socket = &(polledSocketsList[ polledSocketsNumber ]);
-    connection->socket->fd = socketFD;
-    connection->socket->events = POLLRDNORM | POLLRDBAND;
-    polledSocketsNumber++;
-    qsort( polledSocketsList, polledSocketsNumber, sizeof(SocketPoller), CompareSockets );
-  }
-  #else
-  connection->socket = (SocketPoller*) malloc( sizeof(SocketPoller) );
-  FD_SET( socketFD, &polledSocketsSet );
-  if( socketFD >= polledSocketsNumber ) polledSocketsNumber = socketFD + 1;
-  connection->socket->fd = socketFD;
-  #endif
-  
-  connection->messageLength = IP_MAX_MESSAGE_LENGTH;
+  connection->socket = AddSocketPoller( socketFD );
   
   memcpy( &(connection->addressData), address, sizeof(IPAddressData) );
-  connection->ref_clientsCount = malloc( sizeof(size_t) );
   
-  if( networkRole == IP_SERVER ) // Server role connection
+  connection->clientsList = NULL;
+  connection->clientsCount = 0;
+  
+  if( networkRole == IPC_SERVER ) // Server role connection
   {
-    connection->clientsList = NULL;
-    connection->ref_AcceptClient = ( transportProtocol == IP_TCP ) ? AcceptTCPClient : AcceptUDPClient;
-    connection->ref_SendMessage = SendMessageAll;
-    if( transportProtocol == IP_UDP && IS_IP_MULTICAST_ADDRESS( address ) ) connection->ref_SendMessage = SendUDPMessage;
-    connection->ref_Close = ( transportProtocol == IP_TCP ) ? CloseTCPServer : CloseUDPServer;
-    *(connection->ref_clientsCount) = 0;
+    connection->ref_ReceiveMessage = ( transportProtocol == IPC_TCP ) ? ReceiveTCPServerMessages : ReceiveUDPServerMessages;
+    connection->ref_SendMessage = SendServerMessages;
+    if( transportProtocol == IPC_UDP && IS_IP_MULTICAST_ADDRESS( address ) ) connection->ref_SendMessage = SendUDPClientMessage;
+    connection->ref_Close = ( transportProtocol == IPC_TCP ) ? CloseTCPServer : CloseUDPServer;
   }
   else
   { 
     //connection->address->sin6_family = AF_INET6;
-    connection->buffer = (char*) calloc( IP_MAX_MESSAGE_LENGTH, sizeof(char) );
-    connection->ref_ReceiveMessage = ( transportProtocol == IP_TCP ) ? ReceiveTCPMessage : ReceiveUDPMessage;
-    connection->ref_SendMessage = ( transportProtocol == IP_TCP ) ? SendTCPMessage : SendUDPMessage;
-    connection->ref_Close = ( transportProtocol == IP_TCP ) ? CloseTCPClient : CloseUDPClient;
-    connection->server = NULL;
+    connection->ref_ReceiveMessage = ( transportProtocol == IPC_TCP ) ? ReceiveTCPClientMessage : ReceiveUDPClientMessage;
+    connection->ref_SendMessage = ( transportProtocol == IPC_TCP ) ? SendTCPClientMessage : SendUDPClientMessage;
+    connection->ref_Close = ( transportProtocol == IPC_TCP ) ? CloseTCPClient : CloseUDPClient;
   }
   
   return connection;
 }
 
 // Add defined connection to the client list of the given server connection
-static inline void AddClient( IPConnection server, IPConnection client )
+static inline void AddClient( IPConnection server, RemoteID* client )
 {
   size_t clientIndex = 0, clientsListSize = 0;
   
-  client->server = server;
-  
-  size_t clientsNumber = *((size_t*) server->ref_clientsCount);
-  while( clientIndex < clientsNumber )
+  while( clientIndex < server->clientsCount )
   {
     clientsListSize++;
     if( server->clientsList[ clientIndex ] == NULL ) break;
     clientIndex++;      
   }
   
-  if( clientIndex == clientsListSize ) server->clientsList = (IPConnection*) realloc( server->clientsList, ( clientIndex + 1 ) * sizeof(IPConnection) );
+  if( clientIndex == clientsListSize ) server->clientsList = (RemoteID*) realloc( server->clientsList, ( clientIndex + 1 ) * sizeof(RemoteID) );
   
-  server->clientsList[ clientIndex ] = client;
+  memcpy( &(server->clientsList[ clientIndex ]), client, IPC_MAX_ID_LENGTH );
   
-  (*(server->ref_clientsCount))++;
+  server->clientsCount++;
 
   return;
 }
@@ -305,12 +265,12 @@ IPAddress LoadAddressInfo( const char* host, const char* port, uint8_t networkRo
                         
   if( host == NULL )
   {
-    if( networkRole == IP_SERVER )
+    if( networkRole == IPC_SERVER )
     {
       hints.ai_flags |= AI_PASSIVE;                   // Set address for me
       hints.ai_family = AF_INET6;                     // IPv6 address
     }
-    else // if( networkRole == IP_CLIENT )
+    else // if( networkRole == IPC_CLIENT )
       return NULL;
   }
   
@@ -351,12 +311,12 @@ int CreateSocket( uint8_t protocol, IPAddress address )
 {
   int socketType, transportProtocol;
   
-  if( protocol == IP_TCP ) 
+  if( protocol == IPC_TCP ) 
   {
     socketType = SOCK_STREAM;
     transportProtocol = IPPROTO_TCP;
   }
-  else if( protocol == IP_UDP ) 
+  else if( protocol == IPC_UDP ) 
   {
     socketType = SOCK_DGRAM;
     transportProtocol = IPPROTO_UDP;
@@ -369,7 +329,7 @@ int CreateSocket( uint8_t protocol, IPAddress address )
   // Create IP socket
   int socketFD = socket( address->sa_family, socketType, transportProtocol );
   if( socketFD == INVALID_SOCKET )
-    fprintf( stderr, "socket: failed opening %s %s socket", ( protocol == IP_TCP ) ? "TCP" : "UDP", ( address->sa_family == AF_INET6 ) ? "IPv6" : "IPv4" );                                                              
+    fprintf( stderr, "socket: failed opening %s %s socket", ( protocol == IPC_TCP ) ? "TCP" : "UDP", ( address->sa_family == AF_INET6 ) ? "IPv6" : "IPv4" );                                                              
   
   return socketFD;
 }
@@ -585,13 +545,13 @@ IPConnection IP_OpenConnection( uint8_t connectionType, const char* host, uint16
   
   switch( connectionType )
   {
-    case( IP_TCP | IP_SERVER ): if( !BindTCPServerSocket( socketFD, address ) ) return NULL;
+    case( IPC_TCP | IPC_SERVER ): if( !BindTCPServerSocket( socketFD, address ) ) return NULL;
       break;
-    case( IP_UDP | IP_SERVER ): if( !BindUDPServerSocket( socketFD, address ) ) return NULL;
+    case( IPC_UDP | IPC_SERVER ): if( !BindUDPServerSocket( socketFD, address ) ) return NULL;
       break;
-    case( IP_TCP | IP_CLIENT ): if( !ConnectTCPClientSocket( socketFD, address ) ) return NULL;
+    case( IPC_TCP | IPC_CLIENT ): if( !ConnectTCPClientSocket( socketFD, address ) ) return NULL;
       break;
-    case( IP_UDP | IP_CLIENT ): if( !ConnectUDPClientSocket( socketFD, address ) ) return NULL;
+    case( IPC_UDP | IPC_CLIENT ): if( !ConnectUDPClientSocket( socketFD, address ) ) return NULL;
       break;
     default: fprintf( stderr, "invalid connection type: %x", connectionType );
       return NULL;
@@ -600,41 +560,143 @@ IPConnection IP_OpenConnection( uint8_t connectionType, const char* host, uint16
   return AddConnection( socketFD, address, (connectionType & TRANSPORT_MASK), (connectionType & ROLE_MASK) ); // Build the IPConnection structure
 }
 
-size_t IP_SetMessageLength( IPConnection connection, size_t messageLength )
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////                                     ASYNCRONOUS UPDATE                                          /////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static void ReadToQueue( unsigned long connectionID )
 {
-  if( connection == NULL ) return 0;
+  AsyncIPConnection connection = TSM_AcquireItem( globalConnectionsList, connectionID );
+  if( connection == NULL ) return;
   
-  connection->messageLength = ( messageLength > IP_MAX_MESSAGE_LENGTH ) ? IP_MAX_MESSAGE_LENGTH : (uint16_t) messageLength;
-  
-  return (size_t) connection->messageLength;
-}
-
-
-/////////////////////////////////////////////////////////////////////////////////////////
-/////                             GENERIC COMMUNICATION                             /////
-/////////////////////////////////////////////////////////////////////////////////////////
-
-char* IP_ReceiveMessage( IPConnection connection ) 
-{ 
-  memset( connection->buffer, 0, IP_MAX_MESSAGE_LENGTH );
-  
-  return connection->ref_ReceiveMessage( connection ); 
-}
-
-int IP_SendMessage( IPConnection connection, const char* message ) 
-{ 
-  if( strlen( message ) + 1 > connection->messageLength )
+  // Do not proceed if queue is full
+  if( TSQ_GetItemsCount( connection->readQueue ) >= QUEUE_MAX_ITEMS ) 
   {
-    fprintf( stderr, "message too long (%lu bytes for %lu max) !", strlen( message ), connection->messageLength );
-    return 0;
+    TSM_ReleaseItem( globalConnectionsList, connectionID );
+    return;
   }
   
-  //DEBUG_PRINT( "connection socket %d sending message: %s", connection->socket->fd, message );
+  if( IP_IsDataAvailable( connection->baseConnection ) )
+  {
+    if( IP_IsServer( connection->baseConnection ) )
+    {
+      IPConnection newClient = IP_AcceptClient( connection->baseConnection );
+      if( newClient != NULL )
+      {
+        char* addressString = IP_GetAddress( newClient );
+        if( addressString != NULL )
+        {
+          TSM_ReleaseItem( globalConnectionsList, connectionID );
+          unsigned long newClientID = AddAsyncConnection( newClient );
+          TSQ_Enqueue( connection->readQueue, &newClientID, TSQUEUE_WAIT );
+          return;
+        }
+      }
+    }
+    else
+    {
+      char* lastMessage = IP_ReceiveMessage( connection->baseConnection );
+      if( lastMessage != NULL ) TSQ_Enqueue( connection->readQueue, (void*) lastMessage, TSQUEUE_WAIT );
+    }
+  }
   
-  return connection->ref_SendMessage( connection, message ); 
+  TSM_ReleaseItem( globalConnectionsList, connectionID );
 }
 
-IPConnection IP_AcceptClient( IPConnection connection ) { return connection->ref_AcceptClient( connection ); }
+// Loop of message reading (storing in queue) to be called asyncronously for client/server connections
+static void* AsyncReadQueues( void* args )
+{
+  isNetworkRunning = true;
+  
+  while( isNetworkRunning )
+  { 
+    // Blocking call
+    #ifndef IP_NETWORK_LEGACY
+    int eventsNumber = poll( polledSocketsList, polledSocketsNumber, EVENT_WAIT_TIME_MS );
+    #else
+    struct timeval waitTime = { .tv_sec = EVENT_WAIT_TIME_MS / 1000, .tv_usec = ( EVENT_WAIT_TIME_MS % 1000 ) * 1000 };
+    activeSocketsSet = polledSocketsSet;
+    int eventsNumber = select( polledSocketsNumber, &activeSocketsSet, NULL, NULL, &waitTime );
+    #endif
+    if( eventsNumber == SOCKET_ERROR ) fprintf( stderr, "select: error waiting for events on %lu FDs", polledSocketsNumber );
+    
+    if( eventsNumber > 0 ) 
+    {
+      for( size_t connectionIndex = 0; connectionIndex < activeConnectionsCount; connectionIndex++ )
+      {
+        IPConnection connection = globalConnectionsList[ connectionIndex ];
+        if( connection == NULL ) continue;
+        
+        connection->ref_ReceiveMessage( connection );
+      }
+    }
+  }
+  
+  return NULL;
+}
+
+// Loop of message writing (removing in order from queue) to be called asyncronously for client connections
+static void* AsyncWriteQueues( void* args )
+{
+  Message messageOut;
+  
+  isNetworkRunning = true;
+  
+  while( isNetworkRunning )
+  {
+    for( size_t connectionIndex = 0; connectionIndex < activeConnectionsCount; connectionIndex++ )
+    {
+      IPConnection connection = globalConnectionsList[ connectionIndex ];
+      if( connection == NULL ) continue;
+      
+      // Do not proceed if queue is empty
+      if( TSQ_GetItemsCount( connection->writeQueue ) == 0 ) continue;
+      
+      memset( &(messageOut), 0, sizeof(Message) );
+      
+      TSQ_Dequeue( connection->writeQueue, (void*) &messageOut, TSQUEUE_WAIT );
+  
+      connection->ref_SendMessage( connection, (const Byte*) &(messageOut.data), &(messageOut.address) );
+    }
+    
+#ifdef _WIN32
+    Sleep( 1000 );
+#else
+    usleep( 1000*1000 );  /* sleep for 1000 milliSeconds */
+#endif
+  }
+  
+  return NULL;//(void*) 1;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////                                      SYNCRONOUS UPDATE                                          /////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Get (and remove) message from the beginning (oldest) of the given index corresponding read queue
+// Method to be called from the main thread
+bool IP_ReceiveMessage( IPConnection connection, Message* message )
+{  
+  if( connection == NULL ) return false;
+    
+  if( TSQ_GetItemsCount( connection->readQueue ) == 0 ) return false;
+
+  TSQ_Dequeue( connection->readQueue, (void*) message, TSQUEUE_WAIT );
+  
+  return true;
+}
+
+bool IP_SendMessage( IPConnection connection, const Message* message )
+{  
+  if( connection == NULL ) return false;
+  
+  if( TSQ_GetItemsCount( connection->writeQueue ) >= QUEUE_MAX_ITEMS )
+    fprintf( stderr, "connection index %p write queue is full", connection );
+  
+  TSQ_Enqueue( connection->writeQueue, (void*) message, TSQUEUE_NOWAIT );
+  
+  return true;
+}
 
 // Verify available incoming messages for the given connection, preventing unnecessary blocking calls (for syncronous networking)
 int IP_WaitEvent( unsigned int milliseconds )
@@ -651,15 +713,13 @@ int IP_WaitEvent( unsigned int milliseconds )
   return eventsNumber;
 }
 
-bool IP_IsDataAvailable( IPConnection connection )
-{
-  if( connection == NULL ) return false;
-  
+bool IsDataAvailable( SocketPoller* socket )
+{ 
   #ifndef IP_NETWORK_LEGACY
-  if( connection->socket->revents & POLLRDNORM ) return true;
-  else if( connection->socket->revents & POLLRDBAND ) return true;
+  if( socket->revents & POLLRDNORM ) return true;
+  else if( socket->revents & POLLRDBAND ) return true;
   #else
-  if( FD_ISSET( connection->socket->fd, &activeSocketsSet ) ) return true;
+  if( FD_ISSET( socket->fd, &activeSocketsSet ) ) return true;
   #endif
   
   return false;
@@ -672,155 +732,184 @@ bool IP_IsDataAvailable( IPConnection connection )
 static inline void RemoveSocket( Socket );
 
 // Try to receive incoming message from the given TCP client connection and store it on its buffer
-static char* ReceiveTCPMessage( IPConnection connection )
+static void ReceiveTCPClientMessage( IPConnection connection )
 {
-  int bytesReceived;
+  static Message messageIn;
   
-  if( connection->socket->fd == INVALID_SOCKET ) return NULL;
+  if( connection->socket->fd == INVALID_SOCKET ) return;
 
+  //if( TSQ_GetItemsCount( connection->readQueue ) >= QUEUE_MAX_ITEMS ) return;
+  
+  if( IsDataAvailable( connection->socket ) == false ) return;
+  
   // Blocks until there is something to be read in the socket
-  bytesReceived = recv( connection->socket->fd, connection->buffer, connection->messageLength, 0 );
+  int bytesReceived = recv( connection->socket->fd, &(messageIn.data), IPC_MAX_MESSAGE_LENGTH, 0 );
 
   if( bytesReceived == SOCKET_ERROR )
   {
     fprintf( stderr, "recv: error reading from socket %d", connection->socket->fd );
     //connection->socket->fd = INVALID_SOCKET;
     //RemoveSocket( connection->socket->fd );
-    return NULL;
+    return;
   }
   else if( bytesReceived == 0 )
   {
     fprintf( stderr, "recv: remote connection with socket %d closed", connection->socket->fd );
     //connection->socket->fd = INVALID_SOCKET;
     RemoveSocket( connection->socket->fd );
-    return NULL;
+    return;
   }
   
-  //DEBUG_PRINT( "socket %d received message: %s", connection->socketFD, connection->buffer );
+  socklen_t addressLength = 0;
+  getpeername( connection->socket->fd, (IPAddress) &(messageIn.address), &addressLength );
   
-  return connection->buffer;
+  TSQ_Enqueue( connection->readQueue, &(messageIn), TSQUEUE_NOWAIT );
 }
 
 // Send given message through the given TCP connection
-static int SendTCPMessage( IPConnection connection, const char* message )
+static void SendTCPClientMessage( IPConnection connection, const Byte* message, const RemoteID* client )
 {
-  if( send( connection->socket->fd, message, connection->messageLength, 0 ) == SOCKET_ERROR )
+  (void) client;
+  
+  if( send( connection->socket->fd, message, IPC_MAX_MESSAGE_LENGTH, 0 ) == SOCKET_ERROR )
   {
     fprintf( stderr, "send: error writing to socket %d", connection->socket->fd );
-    return -1;
+    //return -1;
   }
   
-  return 0;
+  //return 0;
 }
 
 // Try to receive incoming message from the given UDP client connection and store it on its buffer
-static char* ReceiveUDPMessage( IPConnection connection )
+static void ReceiveUDPClientMessage( IPConnection connection )
 {
-  struct sockaddr_storage address = { 0 };
-  socklen_t addressLength;
+  static Message messageIn;
+  
+  if( IsDataAvailable( connection->socket ) == false ) return;
   
   // Blocks until there is something to be read in the socket
-  if( recvfrom( connection->socket->fd, connection->buffer, connection->messageLength, MSG_PEEK, (IPAddress) &address, &addressLength ) == SOCKET_ERROR )
+  socklen_t addressLength = sizeof(IPAddressData);
+  if( recvfrom( connection->socket->fd, &(messageIn.data), IPC_MAX_MESSAGE_LENGTH, 0, (IPAddress) &(messageIn.address), &addressLength ) == SOCKET_ERROR )
   {
     //fprintf( stderr, "recvfrom: error reading from socket %d", connection->socket->fd );
-    return NULL;
+    return;
   }
-
-  //DEBUG_PRINT( "socket %d received message: %s", connection->socket->fd, connection->buffer );
-  //DEBUG_PRINT( "comparing %u to %u", ntohs( ((struct sockaddr_in*) &(connection->addressData))->sin_port ), ntohs( ((struct sockaddr_in*) &address)->sin_port ) ); 
-
-  // Verify if incoming message is destined to this connection (and returns the message if it is)
-  if( ARE_EQUAL_IP_ADDRESSES( &(connection->addressData), &address ) )
-  {
-    recv( connection->socket->fd, connection->buffer, connection->messageLength, 0 );  
-    //DEBUG_PRINT( "socket %d received right message: %s", connection->socket->fd, connection->buffer );
-    return connection->buffer;
-  }
+    
+  TSQ_Enqueue( connection->readQueue, &(messageIn), TSQUEUE_NOWAIT );
   
   // Default return message (the received one was not destined to this connection) 
-  return NULL;
+  //return NULL;
 }
 
 // Send given message through the given UDP connection
-static int SendUDPMessage( IPConnection connection, const char* message )
+static void SendUDPClientMessage( IPConnection connection, const Byte* message, const RemoteID* client )
 {
-  if( sendto( connection->socket->fd, message, connection->messageLength, 0, (IPAddress) &(connection->addressData), sizeof(IPAddressData) ) == SOCKET_ERROR )
+  (void) client;
+  
+  if( sendto( connection->socket->fd, message, IPC_MAX_MESSAGE_LENGTH, 0, (IPAddress) &(connection->addressData), sizeof(IPAddressData) ) == SOCKET_ERROR )
   {
     fprintf( stderr, "sendto: error writing to socket %d", connection->socket->fd );
-    return -1;
+    //return -1;
   }
   
-  return 0;
+  //return 0;
 }
 
 // Send given message to all the clients of the given server connection
-static int SendMessageAll( IPConnection connection, const char* message )
+static void SendServerMessages( IPConnection connection, const Byte* message, const RemoteID* client )
 {
   size_t clientIndex = 0;
-  size_t clientsNumber = *((size_t*) connection->ref_clientsCount);
-  while( clientIndex < clientsNumber )
+  while( clientIndex < connection->clientsCount )
   {
     if( connection->clientsList[ clientIndex ] != NULL )
     {
-      IP_SendMessage( connection->clientsList[ clientIndex ], message );
+      SocketPoller* clientSocket = (SocketPoller*) client;
+      if( send( clientSocket->fd, message, IPC_MAX_MESSAGE_LENGTH, 0 ) == SOCKET_ERROR )
+      {
+        fprintf( stderr, "send: error writing to socket %d", clientSocket->fd );
+        //return -1;
+      }
       clientIndex++;
     }
   }
   
-  return 0;
+  //return 0;
 }
 
 // Waits for a remote connection to be added to the client list of the given TCP server connection
-static IPConnection AcceptTCPClient( IPConnection server )
-{
-  IPConnection client;
-  int clientSocketFD;
-  static struct sockaddr_storage clientAddress;
-  static socklen_t addressLength = sizeof(clientAddress);
+static void ReceiveTCPServerMessages( IPConnection server )
+{ 
+  static Message messageIn;
   
-  clientSocketFD = accept( server->socket->fd, (struct sockaddr *) &clientAddress, &addressLength );
-
-  if( clientSocketFD == INVALID_SOCKET )
+  if( IsDataAvailable( server->socket ) )
   {
-    fprintf( stderr, "accept: failed accepting connection on socket %d", server->socket->fd );
-    return NULL;
+    socklen_t addressLength = sizeof(IPAddressData);
+    Socket clientSocketFD = accept( server->socket->fd, (IPAddress) &(messageIn.address), &addressLength );
+    if( clientSocketFD == INVALID_SOCKET )
+    {
+      fprintf( stderr, "accept: failed accepting connection on socket %d", server->socket->fd );
+      //return NULL;
+    }
+    else
+    {
+      SocketPoller* clientSocket = AddSocketPoller( clientSocketFD );
+      server->clientsList = (RemoteID*) realloc( server->clientsList, ++server->clientsCount * sizeof(RemoteID) );
+      memcpy( &(server->clientsList[ server->clientsCount - 1 ]), &(clientSocket), sizeof(SocketPoller) );
+    }
   }
   
-  client = AddConnection( clientSocketFD, (IPAddress) &clientAddress, IP_TCP, false );
-
-  AddClient( server, client );
-
-  return client;
+  size_t clientIndex = 0;
+  while( clientIndex < server->clientsCount )
+  {
+    if( server->clientsList[ clientIndex ] != NULL )
+    {
+      memcpy( &clientSocketFD, &(server->clientsList[ clientIndex ]), sizeof(Socket) );
+      if( IsDataAvailable( server->socket ) )
+      {
+        int bytesReceived = recv( clientSocketFD, &(messageIn.data), IPC_MAX_MESSAGE_LENGTH, 0 );
+        if( bytesReceived == SOCKET_ERROR ) 
+          fprintf( stderr, "recv: error reading from socket %d", clientSocketFD );
+        else if( bytesReceived == 0 )
+        {
+          fprintf( stderr, "recv: remote connection with socket %d closed", clientSocketFD );
+          RemoveSocket( clientSocketFD );
+        }
+        else
+        {
+          memcpy( &(messageIn.address), &clientSocketFD, sizeof(Socket) );
+          TSQ_Enqueue( server->readQueue, &(messageIn), TSQUEUE_NOWAIT );
+        }
+      }
+      clientIndex++;
+    }
+  }
 }
 
 // Waits for a remote connection to be added to the client list of the given UDP server connection
-static IPConnection AcceptUDPClient( IPConnection server )
+static void ReceiveUDPServerMessages( IPConnection server )
 {
-  static char buffer[ IP_MAX_MESSAGE_LENGTH ];
-
-  struct sockaddr_storage clientAddress = { 0 };
-  socklen_t addressLength = sizeof(clientAddress);
-  if( recvfrom( server->socket->fd, buffer, IP_MAX_MESSAGE_LENGTH, MSG_PEEK, (IPAddress) &clientAddress, &addressLength ) == SOCKET_ERROR )
+  static Message messageIn;
+  
+  if( IsDataAvailable( server->socket ) == false ) return;
+  
+  socklen_t addressLength = sizeof(IPAddressData);
+  if( recvfrom( server->socket->fd, &(messageIn.data), IPC_MAX_MESSAGE_LENGTH, 0, (IPAddress) &(messageIn.address), &addressLength ) == SOCKET_ERROR )
   {
     fprintf( stderr, "recvfrom: error reading from socket %d", server->socket->fd );
-    return NULL;
+    return;
   }
+  
+  TSQ_Enqueue( server->readQueue, &(messageIn), TSQUEUE_NOWAIT );
   
   // Verify if incoming message belongs to unregistered client (returns default value if not)
-  size_t clientsNumber = *(server->ref_clientsCount);
-  for( size_t clientIndex = 0; clientIndex < clientsNumber; clientIndex++ )
+  for( size_t clientIndex = 0; clientIndex < server->clientsCount; clientIndex++ )
   {
-    if( ARE_EQUAL_IP_ADDRESSES( &(server->clientsList[ clientIndex ]->addressData), &clientAddress ) )
-      return NULL;
+    if( ARE_EQUAL_IP_ADDRESSES( &(server->clientsList[ clientIndex ]), &(messageIn.address) ) )
+      return;
   }
   
-  IPConnection client = AddConnection( server->socket->fd, (IPAddress) &clientAddress, IP_UDP, false );
-
-  AddClient( server, client );
-  
-  //DEBUG_PRINT( "client accepted (clients count after: %lu)", *(server->ref_clientsCount) );
-  
-  return client;
+  server->clientsList = (RemoteID*) realloc( server->clientsList, ++server->clientsCount * sizeof(RemoteID) );
+  memcpy( &(server->clientsList[ server->clientsCount - 1 ]), &(messageIn.address), sizeof(IPAddressData) );
 }
 
 
