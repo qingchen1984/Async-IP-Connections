@@ -30,9 +30,9 @@
 #include <unistd.h>
 #endif
 
-#include "threading/threads.h"
-#include "threading/thread_safe_maps.h"
-#include "threading/thread_safe_queues.h"
+#include "threads/threads.h"
+#include "threads/thread_safe_maps.h"
+#include "threads/thread_safe_queues.h"
 
   
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////

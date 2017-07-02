@@ -6,9 +6,9 @@ set( CMAKE_C_STANDARD_REQUIRED ON )
 
 include_directories( ${CMAKE_CURRENT_LIST_DIR} )
 
-set( LIBRARY_DIR CACHE PATH "Relative or absolute path to directory where built shared libraries will be placed" )
+set( LIBRARY_DIR ${CMAKE_CURRENT_LIST_DIR} CACHE PATH "Relative or absolute path to directory where built shared libraries will be placed" )
 
-set( USE_IP_LEGACY FALSE CACHE BOOL "Enable to compile for older systems, with no modern socket options (e.g. IPv6)" )
+set( USE_IP_LEGACY false CACHE BOOL "Enable to compile for older systems, with no modern socket options (e.g. IPv6)" )
 
 include( ${CMAKE_CURRENT_LIST_DIR}/threads/CMakeLists.txt )
 
@@ -20,6 +20,6 @@ if( UNIX AND NOT APPLE )
 endif()
 target_compile_definitions( AsyncIPConnections PUBLIC -D_DEFAULT_SOURCE=__STRICT_ANSI__ -DDEBUG )
 if( USE_IP_LEGACY )
-  target_compile_definitions( AsyncIPConnections -DIP_NETWORK_LEGACY )
+  target_compile_definitions( AsyncIPConnections PUBLIC -DIP_NETWORK_LEGACY )
 endif()
 
